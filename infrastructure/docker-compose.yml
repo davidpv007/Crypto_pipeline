@@ -1,0 +1,130 @@
+version: '3.8'
+
+x-airflow-common: &airflow-common
+  image: crypto_pipeline/airflow:latest
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    # MinIO / S3A
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    SPARK_CONF_spark.hadoop.fs.s3a.endpoint: http://minio:9000
+    SPARK_CONF_spark.hadoop.fs.s3a.path.style.access: 'true'
+    SPARK_CONF_spark.hadoop.fs.s3a.impl: org.apache.hadoop.fs.s3a.S3AFileSystem
+    # CoinGecko
+    COINGECKO_API_KEY: ${COINGECKO_API_KEY}
+  volumes:
+    - ../airflow/dags:/opt/airflow/dags
+    - ../airflow/plugins:/opt/airflow/plugins
+    - ../src:/opt/airflow/src
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - crypto_net
+
+services:
+
+  # ── MinIO ────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crypto_net
+
+  # ── MinIO Init (creates buckets) ─────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./minio-init.sh:/minio-init.sh
+    entrypoint: ["/bin/sh", "/minio-init.sh"]
+    networks:
+      - crypto_net
+
+  # ── Postgres (Airflow metadata DB) ───────────────────────
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - crypto_net
+
+  # ── Airflow Init ─────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    command: >
+      bash -c "airflow db migrate &&
+               airflow users create
+               --username admin
+               --password admin
+               --firstname Admin
+               --lastname User
+               --role Admin
+               --email admin@example.com"
+    restart: on-failure
+
+  # ── Airflow Webserver ─────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: always
+
+  # ── Airflow Scheduler ─────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: always
+
+  # ── Airflow Worker ────────────────────────────────────────
+  airflow-worker:
+    <<: *airflow-common
+    container_name: airflow-worker
+    command: celery worker
+    restart: always
+
+volumes:
+  minio_data:
+  postgres_data:
+
+networks:
+  crypto_net:
+    driver: bridge
